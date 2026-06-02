@@ -1,0 +1,5 @@
+/target
+# Local layout configs (copy from config/layout.example.toml). The example is tracked.
+/config/layout.toml
+/config/layout.*.toml
+!/config/layout.example.toml

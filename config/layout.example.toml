@@ -1,0 +1,30 @@
+# move freely — example server layout.
+# Copy to config/layout.toml and edit for your machines.
+
+[server]
+# Address the server listens on. 0.0.0.0 accepts LAN clients; use 127.0.0.1
+# to restrict to this machine (handy for the localhost demo below).
+bind = "0.0.0.0:24800"
+# Shared secret. Clients must pass the same value via `--token`. Change this.
+token = "change-me"
+
+# The server's own display. Exactly one screen must have position = "center".
+[[screen]]
+name = "macbook"
+position = "center"
+width = 2560
+height = 1440
+
+# A client to the right of the server's screen.
+[[screen]]
+name = "winbox"
+position = "right"
+width = 1920
+height = 1080
+
+# A client to the left of the server's screen. (Optional — up to 3 total.)
+[[screen]]
+name = "linuxbox"
+position = "left"
+width = 1920
+height = 1080
