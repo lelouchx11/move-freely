@@ -1,12 +1,14 @@
 //! Client role: connect to a server, complete the handshake, and act on the
-//! input events it streams. v1 supports an `--echo` mode that logs events; the
-//! real OS injection backend lands in milestone 2.
+//! input events it streams. With `--echo` it logs events instead of injecting
+//! them (no OS permissions needed); otherwise it injects via the OS backend.
 
 use std::time::Duration;
 
 use anyhow::{bail, Result};
 use mf_protocol::{read_frame, write_frame, Message, PROTOCOL_VERSION};
 use tokio::net::TcpStream;
+
+use crate::input::{new_injector, InputEvent, Injector};
 
 pub struct ConnectOptions {
     pub addr: String,
@@ -43,11 +45,14 @@ pub async fn run(opts: ConnectOptions) -> Result<()> {
         None => bail!("server closed connection during handshake"),
     }
 
-    if !opts.echo {
-        tracing::warn!(
-            "no input backend yet (milestone 2) — run with --echo to log received events"
-        );
-    }
+    // In echo mode we only log; otherwise we build an OS injector up front so a
+    // permission failure surfaces immediately rather than on the first event.
+    let mut injector: Option<Box<dyn Injector>> = if opts.echo {
+        tracing::info!("echo mode: logging received events instead of injecting");
+        None
+    } else {
+        Some(new_injector()?)
+    };
 
     let (mut reader, mut writer) = stream.into_split();
 
@@ -64,29 +69,41 @@ pub async fn run(opts: ConnectOptions) -> Result<()> {
 
     let mut active = false; // whether focus currently sits on this screen
     while let Some(msg) = read_frame(&mut reader).await? {
-        match msg {
+        // Control messages adjust focus; input messages map to an InputEvent.
+        let event = match msg {
             Message::Enter { x, y } => {
                 active = true;
                 log_event(opts.echo, format!("ENTER at ({x}, {y}) — focus now here"));
+                continue;
             }
             Message::Leave => {
                 active = false;
                 log_event(opts.echo, "LEAVE — focus left this screen".into());
+                continue;
             }
-            Message::MouseMoveRel { dx, dy } => {
-                log_event(opts.echo, format!("mouse move rel ({dx}, {dy}) active={active}"));
-            }
+            Message::MouseMoveRel { dx, dy } => InputEvent::MouseMoveRel { dx, dy },
             Message::MouseButton { button, pressed } => {
-                log_event(opts.echo, format!("mouse button {button:?} pressed={pressed}"));
+                InputEvent::MouseButton { button, pressed }
             }
-            Message::Scroll { dx, dy } => {
-                log_event(opts.echo, format!("scroll ({dx}, {dy})"));
+            Message::Scroll { dx, dy } => InputEvent::Scroll { dx, dy },
+            Message::KeyEvent { key, pressed } => InputEvent::Key { key, pressed },
+            Message::Heartbeat => {
+                tracing::debug!("server heartbeat");
+                continue;
             }
-            Message::KeyEvent { key, pressed } => {
-                log_event(opts.echo, format!("key {key:?} pressed={pressed}"));
+            other => {
+                tracing::warn!(?other, "unexpected message from server");
+                continue;
             }
-            Message::Heartbeat => tracing::debug!("server heartbeat"),
-            other => tracing::warn!(?other, "unexpected message from server"),
+        };
+
+        match injector.as_mut() {
+            Some(inj) => {
+                if let Err(e) = inj.inject(&event) {
+                    tracing::warn!(error = %e, ?event, "injection failed");
+                }
+            }
+            None => log_event(opts.echo, format!("{event:?} active={active}")),
         }
     }
 
@@ -95,8 +112,7 @@ pub async fn run(opts: ConnectOptions) -> Result<()> {
     Ok(())
 }
 
-/// In `--echo` mode, surface events at info level; otherwise they would be
-/// injected by the (not-yet-implemented) OS backend, so just trace them.
+/// Surface an event in echo mode at info level (otherwise trace).
 fn log_event(echo: bool, what: String) {
     if echo {
         tracing::info!("{what}");

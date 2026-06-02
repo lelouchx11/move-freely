@@ -2,6 +2,7 @@
 
 mod client;
 mod config;
+mod input;
 mod server;
 
 use std::path::PathBuf;
@@ -49,6 +50,8 @@ enum Command {
         #[arg(long)]
         echo: bool,
     },
+    /// Inject a small test gesture locally to verify OS injection + permissions.
+    Selftest,
 }
 
 #[tokio::main]
@@ -84,5 +87,6 @@ async fn main() -> Result<()> {
             };
             client::run(opts).await
         }
+        Command::Selftest => input::selftest(),
     }
 }

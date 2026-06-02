@@ -18,3 +18,6 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 clap = { workspace = true }
+# Cross-platform input injection (client) and capture/grab (server).
+enigo = "0.3"
+rdev = { version = "0.5", features = ["unstable_grab"] }
