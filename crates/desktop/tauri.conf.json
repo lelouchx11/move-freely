@@ -4,9 +4,15 @@
   "version": "0.2.0",
   "identifier": "io.movefreely.desktop",
   "build": {
-    "beforeDevCommand": "node -e \"const fs=require('fs'),cp=require('child_process'),p=['ui','../ui','../../ui'].find(d=>fs.existsSync(d+'/package.json'));cp.execSync('npm --prefix '+p+' run dev',{stdio:'inherit'})\"",
+    "beforeDevCommand": {
+      "script": "npm run dev",
+      "cwd": "../../ui"
+    },
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "node -e \"const fs=require('fs'),cp=require('child_process'),p=['ui','../ui','../../ui'].find(d=>fs.existsSync(d+'/package.json'));cp.execSync('npm --prefix '+p+' run build',{stdio:'inherit'})\"",
+    "beforeBuildCommand": {
+      "script": "npm run build",
+      "cwd": "../../ui"
+    },
     "frontendDist": "../../ui/dist"
   },
   "app": {
