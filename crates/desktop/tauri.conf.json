@@ -1,0 +1,49 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Move Freely",
+  "version": "0.2.0",
+  "identifier": "io.movefreely.desktop",
+  "build": {
+    "beforeDevCommand": "node -e \"const fs=require('fs'),cp=require('child_process'),p=['ui','../ui','../../ui'].find(d=>fs.existsSync(d+'/package.json'));cp.execSync('npm --prefix '+p+' run dev',{stdio:'inherit'})\"",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "node -e \"const fs=require('fs'),cp=require('child_process'),p=['ui','../ui','../../ui'].find(d=>fs.existsSync(d+'/package.json'));cp.execSync('npm --prefix '+p+' run build',{stdio:'inherit'})\"",
+    "frontendDist": "../../ui/dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Move Freely",
+        "width": 1120,
+        "height": 740,
+        "minWidth": 880,
+        "minHeight": 600,
+        "resizable": true,
+        "center": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: asset:"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "macOS": {
+      "minimumSystemVersion": "11.0",
+      "infoPlist": "Info.plist"
+    },
+    "linux": {
+      "deb": {
+        "depends": ["libx11-6", "libxkbcommon0", "libxclip"]
+      }
+    }
+  }
+}

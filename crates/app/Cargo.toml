@@ -10,14 +10,11 @@ name = "mf"
 path = "src/main.rs"
 
 [dependencies]
-mf-protocol = { path = "../protocol" }
-serde = { workspace = true }
-toml = { workspace = true }
+mf-protocol = { workspace = true }
+mf-core = { workspace = true }
 anyhow = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 clap = { workspace = true }
-# Cross-platform input injection (client) and capture/grab (server).
-enigo = "0.3"
-rdev = { version = "0.5", features = ["unstable_grab"] }
+serde_json = { workspace = true }

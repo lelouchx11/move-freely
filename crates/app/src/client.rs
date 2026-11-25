@@ -1,14 +1,16 @@
-//! Client role: connect to a server, complete the handshake, and act on the
-//! input events it streams. With `--echo` it logs events instead of injecting
-//! them (no OS permissions needed); otherwise it injects via the OS backend.
+//! Legacy v1-compatible client command (`mf connect ... [--echo]`),
+//! backed by `mf-core` native input injection.
 
 use std::time::Duration;
 
 use anyhow::{bail, Result};
-use mf_protocol::{read_frame, write_frame, Message, PROTOCOL_VERSION};
+use mf_core::input::headless::HeadlessInjector;
+use mf_core::input::{new_native_injector, PlatformInjector};
+use mf_protocol::{
+    read_frame, write_frame, ArchKind, ChannelRole, DeviceId, Message, Monitor, OsKind,
+    PeerCapabilities, PROTOCOL_VERSION,
+};
 use tokio::net::TcpStream;
-
-use crate::input::{new_injector, InputEvent, Injector};
 
 pub struct ConnectOptions {
     pub addr: String,
@@ -27,96 +29,104 @@ pub async fn run(opts: ConnectOptions) -> Result<()> {
     write_frame(
         &mut stream,
         &Message::Hello {
+            device_id: DeviceId::from(opts.token.clone()),
             name: opts.name.clone(),
-            width: opts.width,
-            height: opts.height,
-            token: opts.token.clone(),
+            os: OsKind::current(),
+            arch: ArchKind::current(),
             version: PROTOCOL_VERSION,
+            channel: ChannelRole::Control,
+            session_nonce: 1,
+            monitors: vec![Monitor {
+                id: "primary".into(),
+                name: opts.name.clone(),
+                x: 0,
+                y: 0,
+                width: opts.width,
+                height: opts.height,
+                physical_width: opts.width,
+                physical_height: opts.height,
+                scale_factor: 1.0,
+                is_primary: true,
+            }],
+            capabilities: PeerCapabilities::default(),
         },
     )
     .await?;
 
     match read_frame(&mut stream).await? {
-        Some(Message::Welcome { position }) => {
-            tracing::info!(?position, "accepted by server");
+        Some(Message::Welcome { name, .. }) => {
+            tracing::info!(server = %name, "accepted by server");
         }
         Some(Message::Reject { reason }) => bail!("server rejected connection: {reason}"),
         Some(other) => bail!("expected Welcome/Reject, got {other:?}"),
         None => bail!("server closed connection during handshake"),
     }
 
-    // In echo mode we only log; otherwise we build an OS injector up front so a
-    // permission failure surfaces immediately rather than on the first event.
-    let mut injector: Option<Box<dyn Injector>> = if opts.echo {
+    let mut injector: Box<dyn PlatformInjector> = if opts.echo {
         tracing::info!("echo mode: logging received events instead of injecting");
-        None
+        Box::new(HeadlessInjector::new(true))
     } else {
-        Some(new_injector()?)
+        new_native_injector()?
     };
 
     let (mut reader, mut writer) = stream.into_split();
 
-    // Background heartbeat so the server can detect a dead client.
     let heartbeat = tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(5));
+        let mut seq = 0u64;
         loop {
             tick.tick().await;
-            if write_frame(&mut writer, &Message::Heartbeat).await.is_err() {
+            seq += 1;
+            if write_frame(&mut writer, &Message::Heartbeat { seq, sent_ms: 0 })
+                .await
+                .is_err()
+            {
                 break;
             }
         }
     });
 
-    let mut active = false; // whether focus currently sits on this screen
     while let Some(msg) = read_frame(&mut reader).await? {
-        // Control messages adjust focus; input messages map to an InputEvent.
-        let event = match msg {
+        match msg {
             Message::Enter { x, y } => {
-                active = true;
-                log_event(opts.echo, format!("ENTER at ({x}, {y}) — focus now here"));
-                continue;
-            }
-            Message::Leave => {
-                active = false;
-                log_event(opts.echo, "LEAVE — focus left this screen".into());
-                continue;
-            }
-            Message::MouseMoveRel { dx, dy } => InputEvent::MouseMoveRel { dx, dy },
-            Message::MouseButton { button, pressed } => {
-                InputEvent::MouseButton { button, pressed }
-            }
-            Message::Scroll { dx, dy } => InputEvent::Scroll { dx, dy },
-            Message::KeyEvent { key, pressed } => InputEvent::Key { key, pressed },
-            Message::Heartbeat => {
-                tracing::debug!("server heartbeat");
-                continue;
-            }
-            other => {
-                tracing::warn!(?other, "unexpected message from server");
-                continue;
-            }
-        };
-
-        match injector.as_mut() {
-            Some(inj) => {
-                if let Err(e) = inj.inject(&event) {
-                    tracing::warn!(error = %e, ?event, "injection failed");
+                if opts.echo {
+                    tracing::info!(x, y, "ENTER");
                 }
+                let _ = injector.warp_cursor(x, y);
             }
-            None => log_event(opts.echo, format!("{event:?} active={active}")),
+            Message::Leave | Message::ReleaseAllInput => {
+                if opts.echo {
+                    tracing::info!("LEAVE");
+                }
+                let _ = injector.release_all();
+            }
+            Message::PointerMoveAbs { x, y, dx, dy } => {
+                let _ = injector.inject_pointer_abs(x, y, dx, dy);
+            }
+            Message::PointerMoveRel { dx, dy } => {
+                let _ = injector.inject_pointer_rel(dx, dy);
+            }
+            Message::MouseButton { button, pressed } => {
+                let _ = injector.inject_button(button, pressed);
+            }
+            Message::Scroll { dx, dy, continuous } => {
+                let _ = injector.inject_scroll(dx, dy, continuous);
+            }
+            Message::KeyEvent {
+                key,
+                pressed,
+                text,
+                modifiers,
+            } => {
+                let _ = injector.inject_key(key, pressed, text.as_deref(), modifiers);
+            }
+            Message::Heartbeat { .. } => {}
+            other => tracing::debug!(?other, "ignored message"),
         }
     }
 
+    let _ = injector.release_all();
     heartbeat.abort();
     tracing::info!("server closed connection");
     Ok(())
-}
-
-/// Surface an event in echo mode at info level (otherwise trace).
-fn log_event(echo: bool, what: String) {
-    if echo {
-        tracing::info!("{what}");
-    } else {
-        tracing::debug!("{what}");
-    }
 }

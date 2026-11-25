@@ -1,105 +1,73 @@
-# move freely
+# Move Freely
 
-Share **one keyboard + mouse across 2–3 computers** (macOS, Windows, Linux). Push the
-pointer to a screen edge and control hands off to the next machine — a software KVM in the
-spirit of Synergy / Barrier / Mouse Without Borders.
+Share keyboard, mouse, and clipboard seamlessly across **macOS** (Apple Silicon & Intel), **Windows 10/11**, and **Linux** (X11 & Wayland) over your local Wi-Fi or Ethernet network — no extra hardware or cloud servers required.
 
-> **Status:** Milestone 2 — real OS input capture + injection works. The server grabs the
-> local keyboard/mouse and forwards them to a client you switch to with a **hotkey (F12)**.
-> Automatic edge switching (no hotkey) is the next milestone (see [Roadmap](#roadmap)).
+## Highlights
 
-## How it works
+- **Bidirectional Peer-to-Peer Control**: Every device can act as controller or controlled machine and switch roles dynamically via the UI, System Tray/Menu Bar, or global shortcuts.
+- **Interactive 2D Screen Arrangement**: macOS Display Settings–style drag-and-drop canvas supporting horizontal, vertical, multi-monitor, mixed-DPI, edge resistance, corner deadzones, and per-edge transition toggles.
+- **Universal Encrypted Clipboard**: Syncs plain text, multilingual Unicode, rich HTML/RTF, lossless PNG images, and copied files/folders over a dedicated bulk TLS channel with SHA-256 verification and ephemeral staging cleanup.
+- **LAN Security & Discovery**: Automatic mDNS discovery (`_move-freely._tcp.local.`) + manual IP fallback, mutual TLS (ECDSA P-256), channel-bound 6-digit PIN pairing with explicit user consent, trusted peer revocation, and LAN-only IP enforcement.
+- **Low Latency & Reliability**: Priority queuing keeps input events ahead of bulk clipboard transfers, tracks held keys/buttons to prevent stuck modifiers on disconnect, and reconnects automatically across sleep/wake/IP changes.
 
-- **Server** = the machine with the physical keyboard + mouse. It owns *focus* (which screen
-  is active), captures input, and routes it.
-- **Clients** = the other machines. They connect to the server over TCP and inject the input
-  it streams into their own OS.
+## Quick Start
 
-Focus starts on the server's own screen. Press **F12** to cycle focus to the next connected
-client (and again to come back). While a client has focus, the server *grabs* local input —
-your physical mouse/keyboard drive the remote machine — and releases it when focus returns.
-
-One binary, two roles: `mf serve` and `mf connect`.
-
-## Build
-
-This repo currently builds with the **nightly** toolchain (the local stable toolchain is
-broken). Prefix cargo commands with `+nightly` or `rustup default nightly`.
+### Desktop Application (UI + Menu Bar / System Tray)
 
 ```sh
-cargo +nightly build
-cargo +nightly test
+# 1. Install frontend dependencies and build the UI bundle
+npm --prefix ui install
+npm --prefix ui run build
+
+# 2. Run the desktop application in development mode
+./ui/node_modules/.bin/tauri dev --config crates/desktop/tauri.conf.json
+
+# Or build native installers (.dmg/.app, .msi/.exe, .AppImage/.deb)
+./ui/node_modules/.bin/tauri build --config crates/desktop/tauri.conf.json
 ```
 
-## Try it on one machine (no permissions needed)
-
-The `--demo` server sends a scripted input stream; the `--echo` client logs what it receives
-instead of injecting it. Together they prove the handshake → framing → routing pipe.
+### Headless CLI & Daemon (`mf`)
 
 ```sh
-# 1. Make a local config
-cp config/layout.example.toml config/layout.toml
-#    edit bind = "127.0.0.1:24800" and pick a token
+# Build and run all unit + integration tests
+cargo test --workspace
 
-# 2. Start the server (terminal A)
-RUST_LOG=mf=info cargo +nightly run -- serve --config config/layout.toml --demo
+# Start a peer daemon with an active pairing PIN
+cargo run -p mf -- daemon --pin auto
 
-# 3. Connect a client (terminal B)
-RUST_LOG=mf=info cargo +nightly run -- connect 127.0.0.1:24800 \
-    --name winbox --token <your-token> --width 1920 --height 1080 --echo
+# Pair from another computer
+cargo run -p mf -- pair 192.168.1.42:24800 --pin <6-digit-pin>
+
+# Inspect OS permissions and session capabilities
+cargo run -p mf -- permissions
+
+# Verify local input injection
+cargo run -p mf -- selftest
 ```
 
-You should see the client log `ENTER`, mouse moves, button + key events, `scroll`, then `LEAVE`.
-
-## Run it for real (two machines)
-
-This requires OS input permissions (see below). The server captures; the client injects.
+### Legacy Demo / Echo Pipe Verification
 
 ```sh
-# Server — the machine with the keyboard + mouse (config lists the client as a [[screen]])
-RUST_LOG=mf=info cargo +nightly run -- serve --config config/layout.toml
+# Terminal A
+cargo run -p mf -- serve --config config/layout.example.toml --demo
 
-# Client — on the other machine; --name must match a [[screen]], same --token
-RUST_LOG=mf=info cargo +nightly run -- connect <server-ip>:24800 \
-    --name winbox --token <your-token> --width 1920 --height 1080
+# Terminal B
+cargo run -p mf -- connect 127.0.0.1:24800 --name winbox --token change-me --width 1920 --height 1080 --echo
 ```
 
-Press **F12** on the server to hand control to the client; press it again to take it back.
+## Default Shortcuts
 
-### Verify injection works first
+| Action | Default Shortcut |
+| --- | --- |
+| Cycle Active Screen | `F12` |
+| Claim Controller (This Device) | `Ctrl+Alt+Shift+C` |
+| Emergency Release Control | `Ctrl+Alt+Shift+Escape` |
+| Pause / Resume Sharing | `Ctrl+Alt+Shift+P` |
 
-```sh
-cargo +nightly run -- selftest   # nudges the pointer in a square and types "hi"
-```
+All shortcuts are customizable in **Settings -> Keyboard Shortcuts**.
 
-If you see `does not have the permission to simulate input`, grant the permissions below.
+## Documentation
 
-## OS permissions
-
-**macOS** — System Settings → Privacy & Security. Grant *both* to the program that runs
-`mf` (e.g. your terminal app, or the `mf` binary itself):
-- **Accessibility** — required to inject input (client) and to grab input (server).
-- **Input Monitoring** — required for the server to capture the keyboard/mouse.
-
-After granting, fully quit and relaunch the terminal. The server logs a clear error and the
-`selftest` fails fast if either permission is missing.
-
-**Windows / Linux** — no special grants for v1 on Windows; on Linux use an **X11** session
-(Wayland blocks global capture) and your user typically needs access to input devices.
-
-## Configuration
-
-See [`config/layout.example.toml`](config/layout.example.toml). Exactly one screen must be
-`position = "center"` (the server's own display); up to two more may be `left` / `right`.
-
-## Roadmap
-
-1. ✅ **Networking + protocol** — handshake, token auth, length-prefixed framing, heartbeat.
-2. ✅ **Capture + injection** — `enigo` (inject) + `rdev` (capture/grab), with an F12 hotkey
-   to switch the active screen. Cross-platform baseline; macOS validated.
-3. ⬜ **Edge switching** — automatic handoff when the pointer crosses a screen edge (the
-   geometry already lives in `mf-protocol::layout`).
-4. ⬜ **Windows + Linux/X11 backend hardening**.
-5. ⬜ **Polish** — auto-reconnect, optional TLS, mDNS discovery.
-
-Out of scope for v1: clipboard sync, file drag-and-drop, Wayland capture.
+- [Architecture & Ownership Model](docs/ARCHITECTURE.md)
+- [Wire Protocol, Security & Layout Math](docs/PROTOCOL.md)
+- [Platform Implementation, OS Permissions & Troubleshooting](docs/PLATFORMS_AND_PERMISSIONS.md)
