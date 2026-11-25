@@ -1618,11 +1618,17 @@ impl EngineState {
         if !self.permissions.can_capture || !self.can_route_to(&target) {
             return;
         }
+        let Some(ctrl) = &self.capture_ctrl else {
+            return;
+        };
+        ctrl.set_grabbing(true, None);
+        if !ctrl.is_grabbing() {
+            self.emergency_cooldown_until = Some(Instant::now() + Duration::from_secs(1));
+            self.notify("warning", "Could not capture local input. Control stayed on this computer.");
+            return;
+        }
         self.focused_device = target.clone();
         self.remote_routing = Some(PointerRoutingState::new(target.clone(), canvas_x, canvas_y));
-        if let Some(ctrl) = &self.capture_ctrl {
-            ctrl.set_grabbing(true, None);
-        }
         self.net
             .send_high(&target, Message::Enter { x: os_x, y: os_y });
         self.net.broadcast_high(&Message::FocusChange {

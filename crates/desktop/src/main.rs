@@ -307,16 +307,9 @@ fn main() {
         .init();
 
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-    let (engine, _) = rt
-        .block_on(MoveFreelyEngine::start(None, None, EngineMode::Native))
-        .expect("starting Move Freely engine");
-
-    let engine_for_setup = engine.clone();
-    let engine_for_events = engine.clone();
-    let initial_snap = rt.block_on(engine.snapshot()).ok();
+    let engine_runtime = rt.handle().clone();
 
     tauri::Builder::default()
-        .manage(DesktopState { engine })
         .invoke_handler(tauri::generate_handler![
             get_snapshot,
             open_pairing_window,
@@ -347,6 +340,15 @@ fn main() {
             }
         })
         .setup(move |app| {
+            // On Windows, Tauri's event loop registers the process-wide Raw
+            // Input mouse receiver. Start our engine after that registration.
+            let (engine, _) =
+                engine_runtime.block_on(MoveFreelyEngine::start(None, None, EngineMode::Native))?;
+            let mut rx = engine.subscribe();
+            let initial_snap = engine_runtime.block_on(engine.snapshot()).ok();
+            let engine_for_events = engine.clone();
+            app.manage(DesktopState { engine });
+
             let handle = app.handle().clone();
             let tray_menu = build_tray_menu(&handle, initial_snap.as_ref())?;
             let tray_icon = Image::from_bytes(include_bytes!("../icons/32x32.png"))?;
@@ -393,7 +395,6 @@ fn main() {
                 .build(app)?;
 
             let tray_arc = Arc::new(tray);
-            let mut rx = engine_for_setup.subscribe();
             let app_handle = app.handle().clone();
 
             tauri::async_runtime::spawn(async move {

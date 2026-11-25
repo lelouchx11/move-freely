@@ -3,8 +3,9 @@
 //! multi-monitor display enumeration.
 
 use std::collections::HashMap;
+use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{anyhow, Result};
@@ -149,6 +150,7 @@ struct WinHookState {
     last_pos: Mutex<Option<(i32, i32)>>,
     cursor_clip: Mutex<Option<(RECT, Option<RECT>)>>,
     absolute_positions: Mutex<HashMap<usize, (i32, i32)>>,
+    raw_input_window: AtomicPtr<c_void>,
     thread_id: AtomicU32,
 }
 
@@ -156,6 +158,74 @@ static HOOK_STATE: OnceLock<Mutex<Option<Arc<WinHookState>>>> = OnceLock::new();
 
 fn hook_state_cell() -> &'static Mutex<Option<Arc<WinHookState>>> {
     HOOK_STATE.get_or_init(|| Mutex::new(None))
+}
+
+fn register_raw_mouse(hwnd: HWND) -> windows::core::Result<()> {
+    let mouse = RAWINPUTDEVICE {
+        usUsagePage: 0x01,
+        usUsage: 0x02,
+        dwFlags: RIDEV_INPUTSINK,
+        hwndTarget: hwnd,
+    };
+    unsafe { RegisterRawInputDevices(&[mouse], size_of::<RAWINPUTDEVICE>() as u32) }
+}
+
+#[cfg(test)]
+mod raw_input_tests {
+    use super::*;
+    use windows::Win32::UI::Input::GetRegisteredRawInputDevices;
+
+    fn mouse_receiver() -> Option<HWND> {
+        let mut devices = [RAWINPUTDEVICE::default(); 8];
+        let mut count = devices.len() as u32;
+        let count = unsafe {
+            GetRegisteredRawInputDevices(
+                Some(devices.as_mut_ptr()),
+                &mut count,
+                size_of::<RAWINPUTDEVICE>() as u32,
+            )
+        };
+        devices
+            .get(..count as usize)?
+            .iter()
+            .find(|device| (device.usUsagePage, device.usUsage) == (0x01, 0x02))
+            .map(|device| device.hwndTarget)
+    }
+
+    #[test]
+    fn grabbing_restores_raw_mouse_capture_after_another_window_registers() {
+        let capture = start_capture().unwrap();
+        let receiver = mouse_receiver().expect("Move Freely's mouse receiver");
+        let competing = unsafe {
+            CreateWindowExW(
+                Default::default(),
+                w!("Static"),
+                PCWSTR::null(),
+                Default::default(),
+                0,
+                0,
+                0,
+                0,
+                HWND_MESSAGE,
+                None,
+                HINSTANCE::default(),
+                None,
+            )
+        }
+        .unwrap();
+
+        register_raw_mouse(competing).unwrap();
+        let overridden = mouse_receiver();
+        capture.controller.set_grabbing(true, None);
+        let restored = mouse_receiver();
+        let grabbed = capture.controller.is_grabbing();
+        capture.controller.set_grabbing(false, None);
+        unsafe { DestroyWindow(competing).unwrap() };
+
+        assert_eq!(overridden, Some(competing));
+        assert_eq!(restored, Some(receiver));
+        assert!(grabbed);
+    }
 }
 
 struct WinCaptureController {
@@ -170,6 +240,16 @@ impl CaptureController for WinCaptureController {
         }
         unsafe {
             if on {
+                // A later registration by another window in this process
+                // replaces ours. Reclaim the mouse before pinning the cursor.
+                let hwnd = HWND(self.state.raw_input_window.load(Ordering::SeqCst));
+                if hwnd.0.is_null() {
+                    return;
+                }
+                if let Err(error) = register_raw_mouse(hwnd) {
+                    tracing::warn!(%error, "could not register Windows mouse capture for remote control");
+                    return;
+                }
                 self.state.absolute_positions.lock().unwrap().clear();
                 self.state.grabbing.store(true, Ordering::SeqCst);
                 let mut pt = POINT::default();
@@ -415,6 +495,7 @@ pub fn start_capture() -> Result<CaptureSession> {
         last_pos: Mutex::new(None),
         cursor_clip: Mutex::new(None),
         absolute_positions: Mutex::new(HashMap::new()),
+        raw_input_window: AtomicPtr::default(),
         thread_id: AtomicU32::new(0),
     });
 
@@ -458,13 +539,7 @@ pub fn start_capture() -> Result<CaptureSession> {
                 }
             };
 
-            let rid = RAWINPUTDEVICE {
-                usUsagePage: 0x01,
-                usUsage: 0x02, // Mouse
-                dwFlags: RIDEV_INPUTSINK,
-                hwndTarget: hwnd,
-            };
-            if let Err(e) = RegisterRawInputDevices(&[rid], size_of::<RAWINPUTDEVICE>() as u32) {
+            if let Err(e) = register_raw_mouse(hwnd) {
                 let _ = DestroyWindow(hwnd);
                 let _ = ready_tx.send(Err(anyhow!("Raw Input registration failed: {e}")));
                 return;
@@ -488,7 +563,8 @@ pub fn start_capture() -> Result<CaptureSession> {
                 }
             };
 
-            *hook_state_cell().lock().unwrap() = Some(thread_state);
+            thread_state.raw_input_window.store(hwnd.0, Ordering::SeqCst);
+            *hook_state_cell().lock().unwrap() = Some(thread_state.clone());
             let _ = ready_tx.send(Ok(()));
 
             let mut msg = MSG::default();
@@ -497,6 +573,7 @@ pub fn start_capture() -> Result<CaptureSession> {
                 DispatchMessageW(&msg);
             }
 
+            thread_state.raw_input_window.store(std::ptr::null_mut(), Ordering::SeqCst);
             let _ = UnhookWindowsHookEx(kb_hook);
             let _ = UnhookWindowsHookEx(ms_hook);
             if !hwnd.0.is_null() {
