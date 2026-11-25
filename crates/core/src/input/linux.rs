@@ -223,7 +223,7 @@ fn start_x11_capture() -> Result<CaptureSession> {
 
     // Identify XTest slave device IDs so injected events never loop back.
     let mut xtest_devices = std::collections::HashSet::new();
-    if let Ok(devs) = conn.xinput_xi_query_device(xinput::Device::ALL.into())?.reply() {
+    if let Ok(devs) = conn.xinput_xi_query_device(xinput::Device::ALL)?.reply() {
         for d in devs.infos {
             let name = String::from_utf8_lossy(&d.name);
             if name.contains("XTEST") {
