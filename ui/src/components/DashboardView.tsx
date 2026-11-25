@@ -132,6 +132,9 @@ export function DashboardView({ snapshot, onOpenPairModal, onOpenArrangement }: 
                         {peer.connected ? <><Signal /> {peer.latency_ms} ms</> : "Offline"}
                       </span>
                       {!peer.enabled && <span className="pill pill-warn">Disabled</span>}
+                      {peer.connected && peer.enabled && !peer.capabilities.can_inject && (
+                        <span className="pill pill-warn" title={peer.capabilities.status_note ?? undefined}>Cannot receive input</span>
+                      )}
                       {snapshot.active_controller === peer.device_id && <span className="pill pill-accent">Controller</span>}
                       {snapshot.focused_device === peer.device_id && <span className="pill pill-ok">Input here</span>}
                     </div>
@@ -144,7 +147,7 @@ export function DashboardView({ snapshot, onOpenPairModal, onOpenArrangement }: 
                 </div>
                 <div className="row device-actions">
                   {peer.connected && peer.enabled && <>
-                    <button className="btn btn-sm" disabled={!sharing || snapshot.focused_device === peer.device_id} onClick={() => run(api.focusDevice(peer.device_id))}><Crosshair /> Focus here</button>
+                    <button className="btn btn-sm" disabled={!sharing || !local.permissions.can_capture || !peer.capabilities.can_inject || snapshot.focused_device === peer.device_id} onClick={() => run(api.focusDevice(peer.device_id))}><Crosshair /> Focus here</button>
                     <button className="btn btn-sm" disabled={snapshot.active_controller === peer.device_id} onClick={() => run(api.setController(peer.device_id))}>Make controller</button>
                     <button className="btn btn-sm btn-quiet" onClick={() => run(api.disconnectPeer(peer.device_id))}>Disconnect</button>
                   </>}

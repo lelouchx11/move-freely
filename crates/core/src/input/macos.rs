@@ -10,8 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
-use core_foundation::base::{TCFType, UInt16, UInt32, UInt8};
-use core_foundation::data::{CFDataGetBytePtr, CFDataRef};
+use core_foundation::base::TCFType;
 use core_foundation::dictionary::{CFDictionary, CFDictionaryRef};
 use core_foundation::string::{CFString, CFStringRef, UniChar};
 use core_graphics::display::{CGDisplay, CGPoint};
@@ -161,37 +160,6 @@ pub fn enumerate_monitors() -> Vec<Monitor> {
     monitors
 }
 
-// ---------------------------------------------------------------------------
-// Carbon / TIS key layout lookup for Unicode string extraction
-// ---------------------------------------------------------------------------
-
-type TISInputSourceRef = *const c_void;
-
-#[link(name = "Carbon", kind = "framework")]
-extern "C" {
-    fn TISCopyCurrentKeyboardInputSource() -> TISInputSourceRef;
-    fn TISCopyCurrentKeyboardLayoutInputSource() -> TISInputSourceRef;
-    fn TISCopyCurrentASCIICapableKeyboardLayoutInputSource() -> TISInputSourceRef;
-    static kTISPropertyUnicodeKeyLayoutData: CFStringRef;
-    fn TISGetInputSourceProperty(
-        input_source: TISInputSourceRef,
-        property_key: CFStringRef,
-    ) -> CFDataRef;
-    fn UCKeyTranslate(
-        key_layout_ptr: *const UInt8,
-        virtual_key_code: UInt16,
-        key_action: UInt16,
-        modifier_key_state: UInt32,
-        keyboard_type: UInt32,
-        key_translate_options: core_foundation::base::CFIndex,
-        dead_key_state: *mut UInt32,
-        max_string_length: core_foundation::base::CFIndex,
-        actual_string_length: *mut core_foundation::base::CFIndex,
-        unicode_string: *mut UniChar,
-    ) -> core_foundation::base::OSStatus;
-    fn LMGetKbdType() -> UInt8;
-}
-
 #[link(name = "CoreFoundation", kind = "framework")]
 extern "C" {
     fn CFRelease(cf: *const c_void);
@@ -222,6 +190,12 @@ extern "C" {
     fn CGEventGetDoubleValueField(event: *mut core_graphics::sys::CGEvent, field: CGEventField) -> f64;
     fn CGEventGetLocation(event: *mut core_graphics::sys::CGEvent) -> CGPoint;
     fn CGEventGetFlags(event: *mut core_graphics::sys::CGEvent) -> CGEventFlags;
+    fn CGEventKeyboardGetUnicodeString(
+        event: *mut core_graphics::sys::CGEvent,
+        max_string_length: usize,
+        actual_string_length: *mut usize,
+        unicode_string: *mut UniChar,
+    );
 }
 
 type RawTapCallback = unsafe extern "C" fn(
@@ -231,72 +205,16 @@ type RawTapCallback = unsafe extern "C" fn(
     user_info: *mut c_void,
 ) -> *mut core_graphics::sys::CGEvent;
 
-fn translate_cg_keycode_text(keycode: u16, flags: CGEventFlags) -> Option<String> {
+fn keyboard_event_text(event: *mut core_graphics::sys::CGEvent) -> Option<String> {
+    // Event taps run on a worker thread. Read the event's text without calling
+    // Text Input Source APIs, which require the main thread.
+    let mut units = [0; 64];
+    let mut length = 0;
     unsafe {
-        let mut src = TISCopyCurrentKeyboardInputSource();
-        if src.is_null() {
-            return None;
-        }
-        let mut data = TISGetInputSourceProperty(src, kTISPropertyUnicodeKeyLayoutData);
-        if data.is_null() {
-            CFRelease(src);
-            src = TISCopyCurrentKeyboardLayoutInputSource();
-            if !src.is_null() {
-                data = TISGetInputSourceProperty(src, kTISPropertyUnicodeKeyLayoutData);
-            }
-        }
-        if data.is_null() {
-            if !src.is_null() {
-                CFRelease(src);
-            }
-            src = TISCopyCurrentASCIICapableKeyboardLayoutInputSource();
-            if !src.is_null() {
-                data = TISGetInputSourceProperty(src, kTISPropertyUnicodeKeyLayoutData);
-            }
-        }
-        if data.is_null() {
-            if !src.is_null() {
-                CFRelease(src);
-            }
-            return None;
-        }
-        let layout_ptr = CFDataGetBytePtr(data);
-        let mut mod_bits: u32 = 0;
-        if flags.contains(CGEventFlags::CGEventFlagShift) {
-            mod_bits |= 0x02;
-        }
-        if flags.contains(CGEventFlags::CGEventFlagAlphaShift) {
-            mod_bits |= 0x04;
-        }
-        if flags.contains(CGEventFlags::CGEventFlagAlternate) {
-            mod_bits |= 0x08;
-        }
-        let mut dead_key: UInt32 = 0;
-        let mut chars: [UniChar; 4] = [0; 4];
-        let mut len: core_foundation::base::CFIndex = 0;
-        let status = UCKeyTranslate(
-            layout_ptr,
-            keycode,
-            0, // kUCKeyActionDown
-            mod_bits,
-            LMGetKbdType() as u32,
-            1, // kUCKeyTranslateNoDeadKeysMask
-            &mut dead_key,
-            chars.len() as core_foundation::base::CFIndex,
-            &mut len,
-            chars.as_mut_ptr(),
-        );
-        CFRelease(src);
-        if status != 0 || len <= 0 {
-            return None;
-        }
-        let s = String::from_utf16(&chars[..len as usize]).ok()?;
-        if s.chars().all(|c| c.is_control()) {
-            None
-        } else {
-            Some(s)
-        }
+        CGEventKeyboardGetUnicodeString(event, units.len(), &mut length, units.as_mut_ptr());
     }
+    let text = String::from_utf16(units.get(..length)?).ok()?;
+    text.chars().any(|ch| !ch.is_control()).then_some(text)
 }
 
 // ---------------------------------------------------------------------------
@@ -523,8 +441,8 @@ unsafe extern "C" fn event_tap_cb(
                 f.caps_lock = flags.contains(CGEventFlags::CGEventFlagAlphaShift);
                 f
             };
-            let text = if pressed && !mods.has_command_modifier() {
-                translate_cg_keycode_text(code, flags)
+            let text = if grabbing && pressed && !mods.has_command_modifier() {
+                keyboard_event_text(raw_event)
             } else {
                 None
             };

@@ -375,3 +375,102 @@ async fn unauthorized_peer_without_trust_cannot_inject_or_pair_with_bad_pin() {
     let _ = fs::remove_dir_all(host_dir);
     let _ = fs::remove_dir_all(rogue_dir);
 }
+
+#[tokio::test]
+async fn controller_keeps_cursor_when_peer_cannot_receive_input() {
+    use std::sync::{Arc, Mutex};
+
+    use mf_core::network::{LocalAdvertiseState, NetworkManager};
+    use mf_core::security::PairingManager;
+    use mf_core::{DeviceIdentity, TrustedPeerStore};
+    use mf_protocol::{Message, PeerCapabilities};
+
+    let (controller, io, controller_dir, _) = start_node(
+        "controller",
+        vec![make_mon("local", 0, 0, 1920, 1080, 1920, 1080, 1.0, true)],
+    )
+    .await;
+    let dir = std::env::temp_dir().join(format!("mf-unavailable-{}", uuid::Uuid::new_v4()));
+    let identity = DeviceIdentity::load_or_generate(&dir).unwrap();
+    let receiver_id = identity.device_id.clone();
+    let pairing = Arc::new(PairingManager::new());
+    let pin = pairing.open_window(None, Duration::from_secs(30)).unwrap();
+    let (events, _receive_events) = tokio::sync::mpsc::unbounded_channel();
+    let receiver = NetworkManager::new(
+        identity,
+        TrustedPeerStore::load_or_create(&dir).unwrap(),
+        pairing,
+        Arc::new(Mutex::new(AppConfig {
+            bind_ip: "127.0.0.1".into(),
+            listen_port: 0,
+            ..AppConfig::default()
+        })),
+        LocalAdvertiseState {
+            name: "receiver".into(),
+            monitors: vec![make_mon("remote", 0, 0, 1920, 1080, 1920, 1080, 1.0, true)],
+            capabilities: PeerCapabilities {
+                can_inject: false,
+                ..PeerCapabilities::default()
+            },
+            active_controller: None,
+        },
+        events,
+    );
+    let (shutdown, shutdown_rx) = tokio::sync::watch::channel(false);
+    let addr = receiver.start_listener(shutdown_rx).await.unwrap();
+    controller.pair_with_addr(addr, Some(receiver_id.clone()), pin).await.unwrap();
+
+    // Wait for authenticated connection and the capability advertisement.
+    tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            let snapshot = controller.snapshot().await.unwrap();
+            if snapshot.peers.iter().any(|peer| {
+                peer.device_id == receiver_id && peer.connected && !peer.capabilities.can_inject
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("peer did not advertise its input capability");
+
+    controller.focus_device(receiver_id.clone());
+    io.capture_tx.send(InputEvent::LocalPointerMove {
+        x: 1919,
+        y: 500,
+        dx: 20,
+        dy: 0,
+    }).unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let snapshot = controller.snapshot().await.unwrap();
+    assert_eq!(snapshot.focused_device, controller.local_id);
+    assert!(!snapshot.is_grabbing);
+
+    // The same peer can receive input once it advertises that injection is ready.
+    assert!(receiver.send_high(&controller.local_id, Message::CapabilitiesUpdated {
+        capabilities: PeerCapabilities::default(),
+    }));
+    tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            let snapshot = controller.snapshot().await.unwrap();
+            if snapshot.peers.iter().any(|peer| {
+                peer.device_id == receiver_id && peer.connected && peer.capabilities.can_inject
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("peer capability update was not received");
+    controller.focus_device(receiver_id.clone());
+    let snapshot = controller.snapshot().await.unwrap();
+    assert_eq!(snapshot.focused_device, receiver_id);
+    assert!(snapshot.is_grabbing);
+
+    controller.shutdown();
+    let _ = shutdown.send(true);
+    let _ = fs::remove_dir_all(dir);
+    let _ = fs::remove_dir_all(controller_dir);
+}

@@ -359,7 +359,7 @@ impl MoveFreelyEngine {
             match mode {
                 EngineMode::Native => {
                     let mons = enumerate_monitors();
-                    let perms = check_permissions(false);
+                    let mut perms = check_permissions(false);
                     let (cap_rx, cap_ctrl) = match start_native_capture() {
                         Ok(s) => (Some(s.events), Some(s.controller)),
                         Err(e) => {
@@ -374,6 +374,8 @@ impl MoveFreelyEngine {
                             None
                         }
                     };
+                    perms.can_capture &= cap_ctrl.is_some();
+                    perms.can_inject &= inj.is_some();
                     (mons, perms, cap_rx, cap_ctrl, inj, None)
                 }
                 EngineMode::Headless { echo, monitors } => {
@@ -611,7 +613,12 @@ impl EngineState {
                         .map(|l| l.addr.to_string())
                         .or_else(|| tp.last_addrs.first().map(|a| a.to_string())),
                     monitors: live.map(|l| l.monitors.clone()).unwrap_or_default(),
-                    capabilities: live.map(|l| l.capabilities.clone()).unwrap_or_default(),
+                    capabilities: self
+                        .connected_peers
+                        .get(&tp.device_id)
+                        .or(live)
+                        .map(|peer| peer.capabilities.clone())
+                        .unwrap_or_default(),
                 }
             })
             .collect();
@@ -1062,8 +1069,12 @@ impl EngineState {
                 self.emit_snapshot();
             }
             Message::CapabilitiesUpdated { capabilities } => {
+                let can_inject = capabilities.can_inject;
                 if let Some(p) = self.connected_peers.get_mut(&from) {
                     p.capabilities = capabilities;
+                }
+                if !can_inject && self.active_controller == self.local_id && self.focused_device == from {
+                    self.release_focus_to_local();
                 }
                 self.emit_snapshot();
             }
@@ -1396,7 +1407,15 @@ impl EngineState {
         }
 
         let now_ms = self.started_at.elapsed().as_millis() as u64;
-        let topo = self.build_topology();
+        let mut topo = self.build_topology();
+        for device in &mut topo.devices {
+            if device.device_id != self.local_id {
+                device.enabled &= self
+                    .connected_peers
+                    .get(&device.device_id)
+                    .is_some_and(|peer| peer.capabilities.can_inject);
+            }
+        }
 
         // 2. Active controller on local screen -> check automatic edge crossing!
         if self.focused_device == self.local_id {
@@ -1536,6 +1555,12 @@ impl EngineState {
         }
     }
 
+    fn can_route_to(&self, target: &DeviceId) -> bool {
+        self.net.trust_store.is_trusted_and_enabled(target)
+            && self.net.is_connected(target)
+            && self.connected_peers.get(target).is_some_and(|peer| peer.capabilities.can_inject)
+    }
+
     fn enter_remote_device(
         &mut self,
         target: DeviceId,
@@ -1544,7 +1569,7 @@ impl EngineState {
         canvas_x: f64,
         canvas_y: f64,
     ) {
-        if !self.net.is_connected(&target) {
+        if !self.permissions.can_capture || !self.can_route_to(&target) {
             return;
         }
         self.focused_device = target.clone();
@@ -1562,14 +1587,21 @@ impl EngineState {
     }
 
     fn focus_on_device(&mut self, target: DeviceId) {
+        if target != self.local_id {
+            if !self.permissions.can_capture {
+                self.notify("warning", "This computer needs input capture access before it can send keyboard and mouse input.");
+                return;
+            }
+            if !self.can_route_to(&target) {
+                self.notify("warning", "The destination cannot receive input. Check its connection and input permissions.");
+                return;
+            }
+        }
         if self.active_controller != self.local_id {
             self.switch_controller_to(self.local_id.clone());
         }
         if target == self.local_id {
             self.release_focus_to_local();
-            return;
-        }
-        if !self.net.is_connected(&target) {
             return;
         }
         if self.focused_device != self.local_id && self.focused_device != target {
@@ -1594,7 +1626,7 @@ impl EngineState {
         let mut peer_ids: Vec<DeviceId> = self
             .connected_peers
             .keys()
-            .filter(|id| self.net.trust_store.is_trusted_and_enabled(id))
+            .filter(|id| self.can_route_to(id))
             .cloned()
             .collect();
         peer_ids.sort();
