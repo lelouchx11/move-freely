@@ -59,16 +59,7 @@ where
     W: AsyncWrite + Unpin,
 {
     match frame {
-        WireFrame::Message(msg) => {
-            let payload = serde_json::to_vec(msg)?;
-            let total_len = 1usize.saturating_add(payload.len());
-            if total_len > MAX_FRAME_LEN as usize {
-                return Err(FrameError::TooLarge(total_len as u32));
-            }
-            stream.write_all(&(total_len as u32).to_be_bytes()).await?;
-            stream.write_all(&[KIND_JSON_MESSAGE]).await?;
-            stream.write_all(&payload).await?;
-        }
+        WireFrame::Message(msg) => return write_frame(stream, msg).await,
         WireFrame::Chunk(chunk) => {
             let total_len = 1usize
                 .saturating_add(CHUNK_HEADER_LEN)
@@ -146,7 +137,17 @@ pub async fn write_frame<W>(stream: &mut W, msg: &Message) -> Result<(), FrameEr
 where
     W: AsyncWrite + Unpin,
 {
-    write_wire_frame(stream, &WireFrame::Message(msg.clone())).await
+    // Hand TLS the complete frame so its length and tag travel with the payload.
+    let mut frame = vec![0, 0, 0, 0, KIND_JSON_MESSAGE];
+    serde_json::to_writer(&mut frame, msg)?;
+    let len = frame.len() - 4;
+    if len > MAX_FRAME_LEN as usize {
+        return Err(FrameError::TooLarge(len as u32));
+    }
+    frame[..4].copy_from_slice(&(len as u32).to_be_bytes());
+    stream.write_all(&frame).await?;
+    stream.flush().await?;
+    Ok(())
 }
 
 /// Convenience helper: read the next [`Message`] frame (skipping binary chunks if unexpected).

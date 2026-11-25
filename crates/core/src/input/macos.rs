@@ -237,11 +237,11 @@ struct MacCaptureController {
 
 impl CaptureController for MacCaptureController {
     fn set_grabbing(&self, on: bool, warp_to: Option<(i32, i32)>) {
-        let prev = self.ctx.grabbing.swap(on, Ordering::SeqCst);
-        if prev == on {
+        if self.is_grabbing() == on {
             return;
         }
         if on {
+            self.ctx.grabbing.store(true, Ordering::SeqCst);
             let _ = CGDisplay::associate_mouse_and_mouse_cursor_position(false);
             if !self.ctx.cursor_hidden.swap(true, Ordering::SeqCst) {
                 let _ = CGDisplay::main().hide_cursor();
@@ -249,12 +249,13 @@ impl CaptureController for MacCaptureController {
         } else {
             if let Some((wx, wy)) = warp_to {
                 let _ = CGDisplay::warp_mouse_cursor_position(CGPoint::new(wx as f64, wy as f64));
-                *self.ctx.last_local_pos.lock().unwrap() = Some((wx, wy));
             }
+            *self.ctx.last_local_pos.lock().unwrap() = warp_to;
             let _ = CGDisplay::associate_mouse_and_mouse_cursor_position(true);
             if self.ctx.cursor_hidden.swap(false, Ordering::SeqCst) {
                 let _ = CGDisplay::main().show_cursor();
             }
+            self.ctx.grabbing.store(false, Ordering::SeqCst);
         }
     }
 
@@ -313,7 +314,6 @@ unsafe extern "C" fn event_tap_cb(
     match etype {
         // Mouse move & dragged
         5 | 6 | 7 | 27 => {
-            let loc = CGEventGetLocation(raw_event);
             let raw_dx = CGEventGetIntegerValueField(raw_event, EventField::MOUSE_EVENT_DELTA_X) as i32;
             let raw_dy = CGEventGetIntegerValueField(raw_event, EventField::MOUSE_EVENT_DELTA_Y) as i32;
             if grabbing {
@@ -324,6 +324,7 @@ unsafe extern "C" fn event_tap_cb(
                     });
                 }
             } else {
+                let loc = CGEventGetLocation(raw_event);
                 let (x, y) = (loc.x.round() as i32, loc.y.round() as i32);
                 let mut last = ctx.last_local_pos.lock().unwrap();
                 let (dx, dy) = if raw_dx != 0 || raw_dy != 0 {

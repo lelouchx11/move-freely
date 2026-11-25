@@ -591,8 +591,7 @@ impl ClusterTopology {
         let cur_mon = mons
             .iter()
             .find(|m| m.canvas_rect.contains_f64(state.canvas_x, state.canvas_y))
-            .or_else(|| nearest_monitor_canvas(&mons, state.canvas_x, state.canvas_y))?
-            .clone();
+            .or_else(|| nearest_monitor_canvas(&mons, state.canvas_x, state.canvas_y))?;
 
         let next_x = state.canvas_x + step_x;
         let next_y = state.canvas_y + step_y;

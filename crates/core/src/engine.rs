@@ -308,6 +308,7 @@ struct EngineState {
     active_controller: DeviceId,
     focused_device: DeviceId,
     remote_routing: Option<PointerRoutingState>,
+    routing_topology: Option<ClusterTopology>,
     local_resistance: EdgeResistanceTracker,
     emergency_cooldown_until: Option<Instant>,
     remote_held: HeldInputTracker,
@@ -494,6 +495,7 @@ impl MoveFreelyEngine {
             active_controller: local_id.clone(),
             focused_device: local_id.clone(),
             remote_routing: None,
+            routing_topology: None,
             local_resistance: EdgeResistanceTracker::default(),
             emergency_cooldown_until: None,
             remote_held: HeldInputTracker::default(),
@@ -826,6 +828,7 @@ impl EngineState {
                 });
             }
             EngineCommand::DisconnectPeer(id) => {
+                self.routing_topology = None;
                 if self.focused_device == id {
                     self.release_focus_to_local();
                 }
@@ -851,6 +854,7 @@ impl EngineState {
                 self.emit_snapshot();
             }
             EngineCommand::SetPeerEnabled { device_id, enabled } => {
+                self.routing_topology = None;
                 let _ = self.net.trust_store.set_enabled(&device_id, enabled);
                 if !enabled {
                     if self.focused_device == device_id {
@@ -861,6 +865,7 @@ impl EngineState {
                 self.emit_snapshot();
             }
             EngineCommand::RevokePeer(device_id) => {
+                self.routing_topology = None;
                 if self.focused_device == device_id {
                     self.release_focus_to_local();
                 }
@@ -900,6 +905,7 @@ impl EngineState {
                 placements,
                 boundary_mode,
             } => {
+                self.routing_topology = None;
                 {
                     let mut c = self.config.lock().unwrap();
                     c.placements = placements.clone();
@@ -914,6 +920,7 @@ impl EngineState {
                 self.emit_snapshot();
             }
             EngineCommand::UpdateConfig(new_cfg) => {
+                self.routing_topology = None;
                 let old_startup = self.config.lock().unwrap().launch_on_startup;
                 if new_cfg.launch_on_startup != old_startup {
                     if let Err(e) = autostart::set_launch_on_startup(new_cfg.launch_on_startup) {
@@ -958,6 +965,7 @@ impl EngineState {
     }
 
     fn refresh_local_monitors(&mut self) {
+        self.routing_topology = None;
         let mons = enumerate_monitors();
         self.local_monitors = mons.clone();
         self.net
@@ -969,6 +977,7 @@ impl EngineState {
     fn handle_network_event(&mut self, ev: NetworkEvent) {
         match ev {
             NetworkEvent::PeerConnected(info) => {
+                self.routing_topology = None;
                 let pid = info.device_id.clone();
                 self.ensure_placement_for(&pid, &info.monitors);
                 if let Some((r_epoch, r_ctrl)) = &info.active_controller {
@@ -1005,6 +1014,7 @@ impl EngineState {
                 self.emit_snapshot();
             }
             NetworkEvent::PeerDisconnected { device_id, reason } => {
+                self.routing_topology = None;
                 self.connected_peers.remove(&device_id);
                 if self.focused_device == device_id {
                     tracing::warn!(%device_id, %reason, "focused peer disconnected — returning control to local");
@@ -1063,12 +1073,14 @@ impl EngineState {
     fn handle_control_message(&mut self, from: DeviceId, msg: Message) {
         match msg {
             Message::MonitorsUpdated { monitors } => {
+                self.routing_topology = None;
                 if let Some(p) = self.connected_peers.get_mut(&from) {
                     p.monitors = monitors;
                 }
                 self.emit_snapshot();
             }
             Message::CapabilitiesUpdated { capabilities } => {
+                self.routing_topology = None;
                 let can_inject = capabilities.can_inject;
                 if let Some(p) = self.connected_peers.get_mut(&from) {
                     p.capabilities = capabilities;
@@ -1084,6 +1096,7 @@ impl EngineState {
                 boundary_mode,
             } => {
                 if epoch >= self.controller_epoch {
+                    self.routing_topology = None;
                     let mut c = self.config.lock().unwrap();
                     c.placements = placements;
                     c.boundary_mode = boundary_mode;
@@ -1144,7 +1157,7 @@ impl EngineState {
             }
             // Input injection from the active controller!
             Message::Enter { x, y } => {
-                if from != self.active_controller && self.active_controller != from {
+                if from != self.active_controller || self.active_controller == self.local_id {
                     // Reject input from a non-controller peer to prevent competing controllers.
                     return;
                 }
@@ -1160,7 +1173,7 @@ impl EngineState {
                 }
             }
             Message::PointerMoveAbs { x, y, dx, dy } => {
-                if from != self.active_controller || !self.config.lock().unwrap().mouse_sharing {
+                if !self.receives_remote_mouse(&from) {
                     return;
                 }
                 if let Some(inj) = self.injector.as_mut() {
@@ -1168,7 +1181,7 @@ impl EngineState {
                 }
             }
             Message::PointerMoveRel { dx, dy } => {
-                if from != self.active_controller || !self.config.lock().unwrap().mouse_sharing {
+                if !self.receives_remote_mouse(&from) {
                     return;
                 }
                 if let Some(inj) = self.injector.as_mut() {
@@ -1176,7 +1189,7 @@ impl EngineState {
                 }
             }
             Message::MouseButton { button, pressed } => {
-                if from != self.active_controller || !self.config.lock().unwrap().mouse_sharing {
+                if !self.receives_remote_mouse(&from) {
                     return;
                 }
                 if let Some(inj) = self.injector.as_mut() {
@@ -1184,7 +1197,7 @@ impl EngineState {
                 }
             }
             Message::Scroll { dx, dy, continuous } => {
-                if from != self.active_controller || !self.config.lock().unwrap().mouse_sharing {
+                if !self.receives_remote_mouse(&from) {
                     return;
                 }
                 if let Some(inj) = self.injector.as_mut() {
@@ -1197,7 +1210,10 @@ impl EngineState {
                 text,
                 modifiers,
             } => {
-                if from != self.active_controller || !self.config.lock().unwrap().keyboard_sharing {
+                if from != self.active_controller
+                    || self.focused_device != self.local_id
+                    || !self.config.lock().unwrap().keyboard_sharing
+                {
                     return;
                 }
                 if let Some(inj) = self.injector.as_mut() {
@@ -1342,6 +1358,12 @@ impl EngineState {
         }
     }
 
+    fn receives_remote_mouse(&self, from: &DeviceId) -> bool {
+        from == &self.active_controller
+            && self.focused_device == self.local_id
+            && self.config.lock().unwrap().mouse_sharing
+    }
+
     fn handle_input_event(&mut self, ev: InputEvent) {
         if matches!(ev, InputEvent::MonitorsChanged) {
             self.refresh_local_monitors();
@@ -1384,10 +1406,20 @@ impl EngineState {
             }
         }
 
-        let cfg = self.config.lock().unwrap().clone();
-        if !cfg.sharing_enabled {
-            return;
-        }
+        let (mouse_sharing, keyboard_sharing, sensitivity, invert_scroll, scroll_speed, modifier_mapping) = {
+            let cfg = self.config.lock().unwrap();
+            if !cfg.sharing_enabled {
+                return;
+            }
+            (
+                cfg.mouse_sharing,
+                cfg.keyboard_sharing,
+                cfg.sensitivity.clone(),
+                cfg.invert_remote_scroll,
+                cfg.scroll_speed,
+                cfg.modifier_mapping,
+            )
+        };
 
         // If we are NOT the active controller, report local physical mouse activity
         // to the active controller (rate-limited) so its virtual pointer stays synced!
@@ -1406,20 +1438,30 @@ impl EngineState {
             return;
         }
 
-        let now_ms = self.started_at.elapsed().as_millis() as u64;
-        let mut topo = self.build_topology();
-        for device in &mut topo.devices {
-            if device.device_id != self.local_id {
-                device.enabled &= self
-                    .connected_peers
-                    .get(&device.device_id)
-                    .is_some_and(|peer| peer.capabilities.can_inject);
+        if matches!(ev, InputEvent::LocalPointerMove { .. } | InputEvent::RemotePointerDelta { .. })
+            && self.routing_topology.is_none()
+        {
+            let mut topo = self.build_topology();
+            for device in &mut topo.devices {
+                if device.device_id != self.local_id {
+                    device.enabled &= self
+                        .connected_peers
+                        .get(&device.device_id)
+                        .is_some_and(|peer| peer.capabilities.can_inject);
+                }
             }
+            self.routing_topology = Some(topo);
         }
+        let now_ms = self.started_at.elapsed().as_millis() as u64;
 
         // 2. Active controller on local screen -> check automatic edge crossing!
         if self.focused_device == self.local_id {
-            if let InputEvent::LocalPointerMove { x, y, dx, dy } = ev {
+            if let (InputEvent::LocalPointerMove { x, y, dx, dy }, Some(topo)) =
+                (ev, &self.routing_topology)
+            {
+                if !mouse_sharing {
+                    return;
+                }
                 if self
                     .emergency_cooldown_until
                     .is_some_and(|t| Instant::now() < t)
@@ -1440,7 +1482,7 @@ impl EngineState {
                     dy,
                     now_ms,
                     &mut self.local_resistance,
-                    &cfg.sensitivity,
+                    &sensitivity,
                 ) {
                     self.enter_remote_device(target_device, os_x, os_y, canvas_x, canvas_y);
                     self.emit_snapshot();
@@ -1450,20 +1492,23 @@ impl EngineState {
         }
 
         // 3. Active controller driving a REMOTE screen!
-        let target = self.focused_device.clone();
+        let target = &self.focused_device;
         match ev {
             InputEvent::RemotePointerDelta { dx, dy } => {
-                if !cfg.mouse_sharing {
+                if !mouse_sharing {
                     return;
                 }
-                let Some(st) = self.remote_routing.as_mut() else {
+                let (Some(st), Some(topo)) = (self.remote_routing.as_mut(), &self.routing_topology)
+                else {
                     return;
                 };
-                if let Some(outcome) = topo.step_remote(st, dx, dy, now_ms, &cfg.sensitivity) {
+                if let Some(outcome) = topo.step_remote(st, dx, dy, now_ms, &sensitivity) {
                     match outcome {
                         StepOutcome::Stay { os_x, os_y } => {
-                            self.net
-                                .send_high(&target, Message::PointerMoveAbs { x: os_x, y: os_y, dx, dy });
+                            self.net.send_high(
+                                target,
+                                Message::PointerMoveAbs { x: os_x, y: os_y, dx, dy },
+                            );
                         }
                         StepOutcome::Crossed {
                             target_device,
@@ -1472,6 +1517,7 @@ impl EngineState {
                             canvas_x,
                             canvas_y,
                         } => {
+                            let target = target.clone();
                             self.release_remote_held_on(&target);
                             self.net.send_high(&target, Message::Leave);
                             if target_device == self.local_id {
@@ -1500,18 +1546,18 @@ impl EngineState {
                 }
             }
             InputEvent::MouseButton { button, pressed } => {
-                if cfg.mouse_sharing {
+                if mouse_sharing {
                     self.remote_held.record_button(button, pressed);
                     self.net
-                        .send_high(&target, Message::MouseButton { button, pressed });
+                        .send_high(target, Message::MouseButton { button, pressed });
                 }
             }
             InputEvent::Scroll { dx, dy, continuous } => {
-                if cfg.mouse_sharing {
-                    let sign = if cfg.invert_remote_scroll { -1.0 } else { 1.0 };
-                    let speed = cfg.scroll_speed.clamp(0.1, 5.0) * sign;
+                if mouse_sharing {
+                    let sign = if invert_scroll { -1.0 } else { 1.0 };
+                    let speed = scroll_speed.clamp(0.1, 5.0) * sign;
                     self.net.send_high(
-                        &target,
+                        target,
                         Message::Scroll {
                             dx: dx * speed,
                             dy: dy * speed,
@@ -1526,10 +1572,10 @@ impl EngineState {
                 text,
                 modifiers,
             } => {
-                if cfg.keyboard_sharing {
+                if keyboard_sharing {
                     let target_os = self
                         .connected_peers
-                        .get(&target)
+                        .get(target)
                         .map(|p| p.os)
                         .unwrap_or(OsKind::Other);
                     let (mapped_key, mapped_mods) = remap_key_for_target(
@@ -1537,11 +1583,11 @@ impl EngineState {
                         modifiers,
                         OsKind::current(),
                         target_os,
-                        cfg.modifier_mapping,
+                        modifier_mapping,
                     );
                     self.remote_held.record_key(mapped_key, pressed);
                     self.net.send_high(
-                        &target,
+                        target,
                         Message::KeyEvent {
                             key: mapped_key,
                             pressed,

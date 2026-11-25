@@ -2,6 +2,7 @@
 //! `SendInput` virtual-desktop injection, Per-Monitor DPI v2 awareness, and
 //! multi-monitor display enumeration.
 
+use std::collections::HashMap;
 use std::mem::{size_of, zeroed};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -39,15 +40,15 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_VOLUME_MUTE, VK_VOLUME_UP, VK_APPS,
 };
 use windows::Win32::UI::Input::{
-    GetRawInputData, RegisterRawInputDevices, HRAWINPUT, MOUSE_MOVE_RELATIVE, RAWINPUT,
+    GetRawInputData, RegisterRawInputDevices, HRAWINPUT, MOUSE_MOVE_ABSOLUTE, MOUSE_VIRTUAL_DESKTOP, RAWINPUT,
     RAWINPUTDEVICE, RAWINPUTHEADER, RIDEV_INPUTSINK, RID_INPUT, RIM_TYPEMOUSE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    GetCursorPos, GetForegroundWindow, GetMessageW, GetSystemMetrics, GetWindowThreadProcessId,
+    CallNextHookEx, ClipCursor, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
+    GetClipCursor, GetCursorPos, GetForegroundWindow, GetMessageW, GetSystemMetrics, GetWindowThreadProcessId,
     PostThreadMessageW, RegisterClassW, SetCursorPos, SetWindowsHookExW, TranslateMessage,
     UnhookWindowsHookEx, HHOOK, HWND_MESSAGE, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_UP,
-    LLMHF_INJECTED, MSLLHOOKSTRUCT, MSG, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
+    MSLLHOOKSTRUCT, MSG, SM_CXSCREEN, SM_CYSCREEN, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
     SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, WHEEL_DELTA, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_INPUT,
     WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
     WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP,
@@ -146,7 +147,8 @@ struct WinHookState {
     grabbing: AtomicBool,
     mods: Mutex<ModifierStateTracker>,
     last_pos: Mutex<Option<(i32, i32)>>,
-    anchor_pos: Mutex<(i32, i32)>,
+    cursor_clip: Mutex<Option<(RECT, Option<RECT>)>>,
+    absolute_positions: Mutex<HashMap<usize, (i32, i32)>>,
     thread_id: AtomicU32,
 }
 
@@ -162,18 +164,49 @@ struct WinCaptureController {
 
 impl CaptureController for WinCaptureController {
     fn set_grabbing(&self, on: bool, warp_to: Option<(i32, i32)>) {
-        let prev = self.state.grabbing.swap(on, Ordering::SeqCst);
-        if prev == on {
+        let mut clip = self.state.cursor_clip.lock().unwrap();
+        if self.is_grabbing() == on {
             return;
         }
         unsafe {
             if on {
+                self.state.absolute_positions.lock().unwrap().clear();
+                self.state.grabbing.store(true, Ordering::SeqCst);
                 let mut pt = POINT::default();
-                let _ = GetCursorPos(&mut pt);
-                *self.state.anchor_pos.lock().unwrap() = (pt.x, pt.y);
-            } else if let Some((wx, wy)) = warp_to {
-                let _ = SetCursorPos(wx, wy);
-                *self.state.last_pos.lock().unwrap() = Some((wx, wy));
+                let mut previous = RECT::default();
+                if GetCursorPos(&mut pt).is_ok() && GetClipCursor(&mut previous).is_ok() {
+                    let pinned = RECT {
+                        left: pt.x,
+                        top: pt.y,
+                        right: pt.x + 1,
+                        bottom: pt.y + 1,
+                    };
+                    let desktop_left = GetSystemMetrics(SM_XVIRTUALSCREEN);
+                    let desktop_top = GetSystemMetrics(SM_YVIRTUALSCREEN);
+                    let desktop = RECT {
+                        left: desktop_left,
+                        top: desktop_top,
+                        right: desktop_left + GetSystemMetrics(SM_CXVIRTUALSCREEN),
+                        bottom: desktop_top + GetSystemMetrics(SM_CYVIRTUALSCREEN),
+                    };
+                    if ClipCursor(Some(&pinned)).is_ok() {
+                        *clip = Some((pinned, (previous != desktop).then_some(previous)));
+                    }
+                }
+            } else {
+                if let Some((pinned, previous)) = clip.take() {
+                    let mut current = RECT::default();
+                    if GetClipCursor(&mut current).is_ok() && current == pinned {
+                        let _ = ClipCursor(previous.as_ref().map(std::ptr::from_ref));
+                    }
+                }
+                if let Some((wx, wy)) = warp_to {
+                    let _ = SetCursorPos(wx, wy);
+                }
+                let mut pt = POINT::default();
+                let position = GetCursorPos(&mut pt).ok().map(|_| (pt.x, pt.y));
+                *self.state.last_pos.lock().unwrap() = position;
+                self.state.grabbing.store(false, Ordering::SeqCst);
             }
         }
     }
@@ -216,7 +249,8 @@ unsafe extern "system" fn ll_keyboard_proc(code: i32, wparam: WPARAM, lparam: LP
                 m.update(key, pressed);
                 m.flags()
             };
-            let text = if pressed && !mods.has_command_modifier() {
+            let grabbing = state.grabbing.load(Ordering::SeqCst);
+            let text = if grabbing && pressed && !mods.has_command_modifier() {
                 vk_to_unicode(kb.vkCode, kb.scanCode)
             } else {
                 None
@@ -227,7 +261,7 @@ unsafe extern "system" fn ll_keyboard_proc(code: i32, wparam: WPARAM, lparam: LP
                 text,
                 modifiers: mods,
             });
-            if state.grabbing.load(Ordering::SeqCst) {
+            if grabbing {
                 return LRESULT(1);
             }
         }
@@ -238,7 +272,7 @@ unsafe extern "system" fn ll_keyboard_proc(code: i32, wparam: WPARAM, lparam: LP
 unsafe extern "system" fn ll_mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code >= 0 {
         let ms = *(lparam.0 as *const MSLLHOOKSTRUCT);
-        if ms.dwExtraInfo == INJECTED_EXTRA || (ms.flags & LLMHF_INJECTED) != 0 && ms.dwExtraInfo == INJECTED_EXTRA {
+        if ms.dwExtraInfo == INJECTED_EXTRA {
             return CallNextHookEx(HHOOK::default(), code, wparam, lparam);
         }
         let guard = hook_state_cell().lock().unwrap();
@@ -335,34 +369,35 @@ unsafe extern "system" fn raw_wnd_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     if msg == WM_INPUT {
-        let mut size: u32 = 0;
+        let mut raw = RAWINPUT::default();
+        let mut size = size_of::<RAWINPUT>() as u32;
         let hdr_size = size_of::<RAWINPUTHEADER>() as u32;
-        GetRawInputData(HRAWINPUT(lparam.0 as *mut _), RID_INPUT, None, &mut size, hdr_size);
-        if size > 0 {
-            let mut buf = vec![0u8; size as usize];
-            if GetRawInputData(
-                HRAWINPUT(lparam.0 as *mut _),
-                RID_INPUT,
-                Some(buf.as_mut_ptr() as *mut _),
-                &mut size,
-                hdr_size,
-            ) == size
-            {
-                let raw = &*(buf.as_ptr() as *const RAWINPUT);
-                if raw.header.dwType == RIM_TYPEMOUSE.0 {
-                    let mouse = raw.data.mouse;
-                    if (mouse.usFlags.0 & MOUSE_MOVE_RELATIVE.0) == MOUSE_MOVE_RELATIVE.0 || mouse.usFlags.0 == 0 {
-                        let dx = mouse.lLastX;
-                        let dy = mouse.lLastY;
-                        if dx != 0 || dy != 0 {
-                            let guard = hook_state_cell().lock().unwrap();
-                            if let Some(state) = guard.as_ref() {
-                                if state.grabbing.load(Ordering::SeqCst) {
-                                    let _ = state.tx.send(InputEvent::RemotePointerDelta { dx, dy });
-                                }
-                            }
-                        }
-                    }
+        let read = GetRawInputData(
+            HRAWINPUT(lparam.0 as *mut _),
+            RID_INPUT,
+            Some((&mut raw as *mut RAWINPUT).cast()),
+            &mut size,
+            hdr_size,
+        );
+        if read == size_of::<RAWINPUT>() as u32 && raw.header.dwType == RIM_TYPEMOUSE.0 {
+            let guard = hook_state_cell().lock().unwrap();
+            if let Some(state) = guard.as_ref().filter(|s| s.grabbing.load(Ordering::SeqCst)) {
+                let mouse = raw.data.mouse;
+                let (dx, dy) = if mouse.usFlags.0 & MOUSE_MOVE_ABSOLUTE.0 != 0 {
+                    let (width, height) = if mouse.usFlags.0 & MOUSE_VIRTUAL_DESKTOP.0 != 0 {
+                        (GetSystemMetrics(SM_CXVIRTUALSCREEN), GetSystemMetrics(SM_CYVIRTUALSCREEN))
+                    } else {
+                        (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN))
+                    };
+                    let x = (i64::from(mouse.lLastX) * i64::from(width) / 65535) as i32;
+                    let y = (i64::from(mouse.lLastY) * i64::from(height) / 65535) as i32;
+                    state.absolute_positions.lock().unwrap().insert(raw.header.hDevice.0 as usize, (x, y))
+                        .map_or((0, 0), |(px, py)| (x - px, y - py))
+                } else {
+                    (mouse.lLastX, mouse.lLastY)
+                };
+                if dx != 0 || dy != 0 {
+                    let _ = state.tx.send(InputEvent::RemotePointerDelta { dx, dy });
                 }
             }
         }
@@ -378,11 +413,10 @@ pub fn start_capture() -> Result<CaptureSession> {
         grabbing: AtomicBool::new(false),
         mods: Mutex::new(ModifierStateTracker::default()),
         last_pos: Mutex::new(None),
-        anchor_pos: Mutex::new((0, 0)),
+        cursor_clip: Mutex::new(None),
+        absolute_positions: Mutex::new(HashMap::new()),
         thread_id: AtomicU32::new(0),
     });
-
-    *hook_state_cell().lock().unwrap() = Some(state.clone());
 
     let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<Result<()>>(1);
     let thread_state = state.clone();
@@ -403,7 +437,7 @@ pub fn start_capture() -> Result<CaptureSession> {
                 ..zeroed()
             };
             RegisterClassW(&wc);
-            let hwnd = CreateWindowExW(
+            let hwnd = match CreateWindowExW(
                 Default::default(),
                 cls_name,
                 w!("MoveFreelyHookWnd"),
@@ -416,22 +450,30 @@ pub fn start_capture() -> Result<CaptureSession> {
                 None,
                 hinst,
                 None,
-            )
-            .unwrap_or_default();
+            ) {
+                Ok(hwnd) => hwnd,
+                Err(e) => {
+                    let _ = ready_tx.send(Err(anyhow!("Raw Input window creation failed: {e}")));
+                    return;
+                }
+            };
 
-            if !hwnd.0.is_null() {
-                let rid = RAWINPUTDEVICE {
-                    usUsagePage: 0x01,
-                    usUsage: 0x02, // Mouse
-                    dwFlags: RIDEV_INPUTSINK,
-                    hwndTarget: hwnd,
-                };
-                let _ = RegisterRawInputDevices(&[rid], size_of::<RAWINPUTDEVICE>() as u32);
+            let rid = RAWINPUTDEVICE {
+                usUsagePage: 0x01,
+                usUsage: 0x02, // Mouse
+                dwFlags: RIDEV_INPUTSINK,
+                hwndTarget: hwnd,
+            };
+            if let Err(e) = RegisterRawInputDevices(&[rid], size_of::<RAWINPUTDEVICE>() as u32) {
+                let _ = DestroyWindow(hwnd);
+                let _ = ready_tx.send(Err(anyhow!("Raw Input registration failed: {e}")));
+                return;
             }
 
             let kb_hook = match SetWindowsHookExW(WH_KEYBOARD_LL, Some(ll_keyboard_proc), hinst, 0) {
                 Ok(h) => h,
                 Err(e) => {
+                    let _ = DestroyWindow(hwnd);
                     let _ = ready_tx.send(Err(anyhow!("WH_KEYBOARD_LL failed: {e}")));
                     return;
                 }
@@ -440,11 +482,13 @@ pub fn start_capture() -> Result<CaptureSession> {
                 Ok(h) => h,
                 Err(e) => {
                     let _ = UnhookWindowsHookEx(kb_hook);
+                    let _ = DestroyWindow(hwnd);
                     let _ = ready_tx.send(Err(anyhow!("WH_MOUSE_LL failed: {e}")));
                     return;
                 }
             };
 
+            *hook_state_cell().lock().unwrap() = Some(thread_state);
             let _ = ready_tx.send(Ok(()));
 
             let mut msg = MSG::default();

@@ -1,7 +1,7 @@
 //! Encrypted peer-to-peer TLS transport, pairing handshake, dual Control/Data
 //! channels, priority queuing, RTT heartbeat, and automatic reconnection.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -15,7 +15,7 @@ use mf_protocol::{
 use rustls::pki_types::ServerName;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Notify};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 use crate::config::AppConfig;
@@ -79,11 +79,52 @@ pub struct PeerInfo {
 struct PeerSession {
     info: PeerInfo,
     session_nonce: u64,
-    high_tx: mpsc::UnboundedSender<Message>,
+    high_queue: Arc<HighPriorityQueue>,
     normal_tx: mpsc::UnboundedSender<Message>,
     data_tx: Mutex<Option<mpsc::Sender<WireFrame>>>,
     latency_ms: Arc<AtomicU64>,
     cancel_tx: oneshot::Sender<()>,
+}
+
+#[derive(Default)]
+struct HighPriorityQueue {
+    pending: Mutex<VecDeque<Message>>,
+    ready: Notify,
+}
+
+impl HighPriorityQueue {
+    fn push(&self, msg: Message) {
+        let mut pending = self.pending.lock().unwrap();
+        // A newer absolute sample supersedes a queued sample. Keep clicks,
+        // key events and focus changes in their original order.
+        if let (
+            Some(Message::PointerMoveAbs { x, y, dx, dy }),
+            Message::PointerMoveAbs { x: next_x, y: next_y, dx: next_dx, dy: next_dy },
+        ) = (pending.back_mut(), &msg)
+        {
+            *x = *next_x;
+            *y = *next_y;
+            *dx = dx.saturating_add(*next_dx);
+            *dy = dy.saturating_add(*next_dy);
+            return;
+        }
+        let was_empty = pending.is_empty();
+        pending.push_back(msg);
+        drop(pending);
+        if was_empty {
+            self.ready.notify_one();
+        }
+    }
+
+    async fn recv(&self) -> Message {
+        tokio::task::consume_budget().await;
+        loop {
+            if let Some(msg) = self.pending.lock().unwrap().pop_front() {
+                return msg;
+            }
+            self.ready.notified().await;
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -154,7 +195,8 @@ impl NetworkManager {
     pub fn send_high(&self, id: &DeviceId, msg: Message) -> bool {
         let guard = self.sessions.lock().unwrap();
         if let Some(s) = guard.get(id) {
-            s.high_tx.send(msg).is_ok()
+            s.high_queue.push(msg);
+            true
         } else {
             false
         }
@@ -173,7 +215,7 @@ impl NetworkManager {
     pub fn broadcast_high(&self, msg: &Message) {
         let guard = self.sessions.lock().unwrap();
         for s in guard.values() {
-            let _ = s.high_tx.send(msg.clone());
+            s.high_queue.push(msg.clone());
         }
     }
 
@@ -205,7 +247,7 @@ impl NetworkManager {
 
     pub fn disconnect_peer(&self, id: &DeviceId, reason: &str) {
         if let Some(session) = self.sessions.lock().unwrap().remove(id) {
-            let _ = session.high_tx.send(Message::Goodbye {
+            session.high_queue.push(Message::Goodbye {
                 reason: reason.to_string(),
             });
             let _ = session.cancel_tx.send(());
@@ -901,7 +943,7 @@ impl NetworkManager {
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         let peer_id = info.device_id.clone();
-        let (high_tx, mut high_rx) = mpsc::unbounded_channel::<Message>();
+        let high_queue = Arc::new(HighPriorityQueue::default());
         let (normal_tx, mut normal_rx) = mpsc::unbounded_channel::<Message>();
         let (cancel_tx, mut cancel_rx) = oneshot::channel::<()>();
         let latency_ms = Arc::new(AtomicU64::new(0));
@@ -912,7 +954,7 @@ impl NetworkManager {
             PeerSession {
                 info: info.clone(),
                 session_nonce,
-                high_tx: high_tx.clone(),
+                high_queue: high_queue.clone(),
                 normal_tx,
                 data_tx: Mutex::new(None),
                 latency_ms: latency_ms.clone(),
@@ -927,14 +969,12 @@ impl NetworkManager {
 
         tokio::spawn(async move {
             let (mut reader, mut writer) = tokio::io::split(tls);
-            let writer_task = tokio::spawn(async move {
+            let writer_queue = high_queue.clone();
+            let mut writer_task = tokio::spawn(async move {
                 loop {
                     let msg = tokio::select! {
                         biased;
-                        m = high_rx.recv() => match m {
-                            Some(m) => m,
-                            None => break,
-                        },
+                        m = writer_queue.recv() => m,
                         m = normal_rx.recv() => match m {
                             Some(m) => m,
                             None => break,
@@ -952,75 +992,69 @@ impl NetworkManager {
             let mut hb_tick = tokio::time::interval(HEARTBEAT_INTERVAL);
             hb_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-            let mut disconnect_reason = "connection closed".to_string();
-
-            loop {
-                tokio::select! {
-                    _ = &mut cancel_rx => {
-                        disconnect_reason = "superseded or disconnected".into();
-                        break;
-                    }
-                    _ = hb_tick.tick() => {
-                        if last_rx.elapsed() > HEARTBEAT_TIMEOUT {
-                            disconnect_reason = "heartbeat timeout".into();
-                            break;
-                        }
-                        hb_seq = hb_seq.wrapping_add(1);
-                        let sent_ms = start.elapsed().as_millis() as u64;
-                        if high_tx.send(Message::Heartbeat { seq: hb_seq, sent_ms }).is_err() {
-                            break;
-                        }
-                    }
-                    frame = read_wire_frame(&mut reader) => {
-                        match frame {
-                            Ok(Some(WireFrame::Message(msg))) => {
-                                last_rx = Instant::now();
-                                match msg {
-                                    Message::Heartbeat { seq, sent_ms } => {
-                                        let _ = high_tx.send(Message::HeartbeatAck { seq, echoed_ms: sent_ms });
-                                    }
-                                    Message::HeartbeatAck { echoed_ms, .. } => {
-                                        let now_ms = start.elapsed().as_millis() as u64;
-                                        let rtt = now_ms.saturating_sub(echoed_ms);
-                                        let prev = latency_ms.load(Ordering::Relaxed);
-                                        let smoothed = if prev == 0 { rtt } else { (prev * 3 + rtt) / 4 };
-                                        latency_ms.store(smoothed, Ordering::Relaxed);
-                                        let _ = mgr.event_tx.send(NetworkEvent::LatencyUpdated {
-                                            device_id: peer_id.clone(),
-                                            latency_ms: smoothed,
-                                        });
-                                    }
-                                    Message::Goodbye { reason } => {
-                                        disconnect_reason = reason;
-                                        break;
-                                    }
-                                    other => {
-                                        let _ = mgr.event_tx.send(NetworkEvent::ControlMessage {
-                                            from: peer_id.clone(),
-                                            msg: other,
-                                        });
-                                    }
-                                }
+            let disconnect_reason = 'connection: loop {
+                // Keep a partially read frame alive across heartbeat ticks.
+                let read = read_wire_frame(&mut reader);
+                tokio::pin!(read);
+                let frame = loop {
+                    tokio::select! {
+                        _ = &mut cancel_rx => break 'connection "superseded or disconnected".into(),
+                        _ = &mut writer_task => break 'connection "control writer closed".into(),
+                        _ = hb_tick.tick() => {
+                            if last_rx.elapsed() > HEARTBEAT_TIMEOUT {
+                                break 'connection "heartbeat timeout".into();
                             }
-                            Ok(Some(WireFrame::Chunk(chunk))) => {
-                                last_rx = Instant::now();
-                                let _ = mgr.event_tx.send(NetworkEvent::DataChunk {
-                                    from: peer_id.clone(),
-                                    chunk,
+                            hb_seq = hb_seq.wrapping_add(1);
+                            let sent_ms = start.elapsed().as_millis() as u64;
+                            high_queue.push(Message::Heartbeat { seq: hb_seq, sent_ms });
+                        }
+                        frame = &mut read => break frame,
+                    }
+                };
+                match frame {
+                    Ok(Some(WireFrame::Message(msg))) => {
+                        last_rx = Instant::now();
+                        match msg {
+                            Message::Heartbeat { seq, sent_ms } => {
+                                high_queue.push(Message::HeartbeatAck { seq, echoed_ms: sent_ms });
+                            }
+                            Message::HeartbeatAck { echoed_ms, .. } => {
+                                let now_ms = start.elapsed().as_millis() as u64;
+                                let rtt = now_ms.saturating_sub(echoed_ms);
+                                let prev = latency_ms.load(Ordering::Relaxed);
+                                let smoothed = if prev == 0 { rtt } else { (prev * 3 + rtt) / 4 };
+                                latency_ms.store(smoothed, Ordering::Relaxed);
+                                let _ = mgr.event_tx.send(NetworkEvent::LatencyUpdated {
+                                    device_id: peer_id.clone(),
+                                    latency_ms: smoothed,
                                 });
                             }
-                            Ok(None) => {
-                                disconnect_reason = "peer closed stream".into();
-                                break;
+                            Message::Goodbye { reason } => {
+                                break reason;
                             }
-                            Err(e) => {
-                                disconnect_reason = format!("read error: {e}");
-                                break;
+                            other => {
+                                let _ = mgr.event_tx.send(NetworkEvent::ControlMessage {
+                                    from: peer_id.clone(),
+                                    msg: other,
+                                });
                             }
                         }
                     }
+                    Ok(Some(WireFrame::Chunk(chunk))) => {
+                        last_rx = Instant::now();
+                        let _ = mgr.event_tx.send(NetworkEvent::DataChunk {
+                            from: peer_id.clone(),
+                            chunk,
+                        });
+                    }
+                    Ok(None) => {
+                        break "peer closed stream".into();
+                    }
+                    Err(e) => {
+                        break format!("read error: {e}");
+                    }
                 }
-            }
+            };
 
             writer_task.abort();
             let should_notify = {
@@ -1105,6 +1139,22 @@ impl NetworkManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn queued_pointer_motion_keeps_latest_position_and_click_order() {
+        let queue = HighPriorityQueue::default();
+        for x in 1..=1000 {
+            queue.push(Message::PointerMoveAbs { x, y: 20, dx: 1, dy: 0 });
+        }
+        let click = Message::MouseButton { button: mf_protocol::Button::Left, pressed: true };
+        queue.push(click.clone());
+        queue.push(Message::PointerMoveAbs { x: 1010, y: 25, dx: 10, dy: 5 });
+
+        assert_eq!(queue.pending.lock().unwrap().len(), 3);
+        assert_eq!(queue.recv().await, Message::PointerMoveAbs { x: 1000, y: 20, dx: 1000, dy: 0 });
+        assert_eq!(queue.recv().await, click);
+        assert_eq!(queue.recv().await, Message::PointerMoveAbs { x: 1010, y: 25, dx: 10, dy: 5 });
+    }
 
     #[tokio::test]
     async fn two_peers_pair_over_tls_and_exchange_authenticated_messages() {

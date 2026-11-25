@@ -184,6 +184,11 @@ async fn full_cluster_bidirectional_control_multi_monitor_and_clipboard() {
     tokio::time::sleep(Duration::from_millis(120)).await;
     let win_events = win_io.injector.snapshot();
     assert!(win_events.iter().any(|e| matches!(e, RecordedInjection::Warp { .. })));
+    assert!(win_events.iter().any(|e| matches!(e, RecordedInjection::PointerAbs { x, .. } if *x > 1920)));
+    assert!(!mac_io.injector.snapshot().iter().any(|e| matches!(
+        e,
+        RecordedInjection::PointerAbs { .. } | RecordedInjection::PointerRel { .. }
+    )));
     assert!(win_events.iter().any(|e| matches!(
         e,
         RecordedInjection::Button {
