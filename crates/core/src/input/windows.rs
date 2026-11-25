@@ -628,7 +628,7 @@ impl PlatformInjector for WinInjector {
                 let mut buf = [0u16; 2];
                 let units = ch.encode_utf16(&mut buf);
                 let mut inputs = Vec::new();
-                for &u in units {
+                for &u in units.iter() {
                     inputs.push(Self::key_input(KEYEVENTF_UNICODE, VIRTUAL_KEY(0), u));
                     inputs.push(Self::key_input(
                         KEYEVENTF_UNICODE | KEYEVENTF_KEYUP,

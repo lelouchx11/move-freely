@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{anyhow, Context, Result};
@@ -18,7 +18,6 @@ use x11rb::protocol::xproto::{self, ConnectionExt as _, EventMask, GrabMode};
 use x11rb::protocol::xtest::ConnectionExt as _;
 use x11rb::protocol::Event as XEvent;
 use x11rb::rust_connection::RustConnection;
-use xkbcommon::xkb;
 
 use super::{
     CaptureController, CaptureSession, HeldInputTracker, InputEvent, ModifierStateTracker,
@@ -339,7 +338,7 @@ fn start_x11_capture() -> Result<CaptureSession> {
                             if xtest_devices.contains(&rm.sourceid) {
                                 continue;
                             }
-                            let (dx, dy) = extract_raw_xy(&rm.valuators_mask, &rm.axisvalues_raw);
+                            let (dx, dy) = extract_raw_xy(&rm.valuator_mask, &rm.axisvalues_raw);
                             if dx == 0 && dy == 0 {
                                 continue;
                             }
