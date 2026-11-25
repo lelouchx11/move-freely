@@ -148,10 +148,89 @@ struct WinHookState {
     grabbing: AtomicBool,
     mods: Mutex<ModifierStateTracker>,
     last_pos: Mutex<Option<(i32, i32)>>,
-    cursor_clip: Mutex<Option<(RECT, Option<RECT>)>>,
+    cursor_clip: Mutex<Option<CursorClip>>,
     absolute_positions: Mutex<HashMap<usize, (i32, i32)>>,
     raw_input_window: AtomicPtr<c_void>,
     thread_id: AtomicU32,
+}
+
+struct CursorClip {
+    pinned: RECT,
+    previous: Option<RECT>,
+    foreground: usize,
+}
+
+impl CursorClip {
+    fn acquire() -> windows::core::Result<Self> {
+        unsafe {
+            let mut pt = POINT::default();
+            GetCursorPos(&mut pt)?;
+            let mut previous = RECT::default();
+            GetClipCursor(&mut previous)?;
+            let pinned = RECT {
+                left: pt.x,
+                top: pt.y,
+                right: pt.x + 1,
+                bottom: pt.y + 1,
+            };
+            let desktop_left = GetSystemMetrics(SM_XVIRTUALSCREEN);
+            let desktop_top = GetSystemMetrics(SM_YVIRTUALSCREEN);
+            let desktop = RECT {
+                left: desktop_left,
+                top: desktop_top,
+                right: desktop_left + GetSystemMetrics(SM_CXVIRTUALSCREEN),
+                bottom: desktop_top + GetSystemMetrics(SM_CYVIRTUALSCREEN),
+            };
+            ClipCursor(Some(&pinned))?;
+            Ok(Self {
+                pinned,
+                previous: (previous != desktop).then_some(previous),
+                foreground: GetForegroundWindow().0 as usize,
+            })
+        }
+    }
+
+    fn still_pinned(&self) -> bool {
+        let mut current = RECT::default();
+        unsafe { GetClipCursor(&mut current).is_ok() && current == self.pinned }
+    }
+
+    fn still_isolated(&mut self) -> bool {
+        if !self.still_pinned() {
+            return false;
+        }
+        let foreground = unsafe { GetForegroundWindow() }.0 as usize;
+        if self.foreground == 0 {
+            self.foreground = foreground;
+        }
+        // Windows can report null briefly during a change in activation.
+        foreground == 0 || foreground == self.foreground
+    }
+
+    fn restore(self) {
+        if self.still_pinned() {
+            let _ = unsafe { ClipCursor(self.previous.as_ref().map(std::ptr::from_ref)) };
+        }
+    }
+}
+
+impl WinHookState {
+    fn can_forward_motion(&self) -> bool {
+        // The engine may be pinning or restoring the cursor. Never wait for
+        // that operation on the thread that delivers Windows input.
+        let Ok(mut clip) = self.cursor_clip.try_lock() else {
+            return false;
+        };
+        if !self.grabbing.load(Ordering::SeqCst) {
+            return false;
+        }
+        if clip.as_mut().is_some_and(CursorClip::still_isolated) {
+            return true;
+        }
+        self.grabbing.store(false, Ordering::SeqCst);
+        let _ = self.tx.send(InputEvent::CaptureLost);
+        false
+    }
 }
 
 static HOOK_STATE: OnceLock<Mutex<Option<Arc<WinHookState>>>> = OnceLock::new();
@@ -235,11 +314,11 @@ struct WinCaptureController {
 impl CaptureController for WinCaptureController {
     fn set_grabbing(&self, on: bool, warp_to: Option<(i32, i32)>) {
         let mut clip = self.state.cursor_clip.lock().unwrap();
-        if self.is_grabbing() == on {
-            return;
-        }
         unsafe {
             if on {
+                if self.is_grabbing() || clip.is_some() {
+                    return;
+                }
                 // A later registration by another window in this process
                 // replaces ours. Reclaim the mouse before pinning the cursor.
                 let hwnd = HWND(self.state.raw_input_window.load(Ordering::SeqCst));
@@ -250,35 +329,26 @@ impl CaptureController for WinCaptureController {
                     tracing::warn!(%error, "could not register Windows mouse capture for remote control");
                     return;
                 }
+                let acquired = match CursorClip::acquire() {
+                    Ok(acquired) if acquired.still_pinned() => acquired,
+                    Ok(acquired) => {
+                        acquired.restore();
+                        tracing::warn!("Windows did not keep the local cursor pinned");
+                        return;
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "could not pin the Windows cursor for remote control");
+                        return;
+                    }
+                };
                 self.state.absolute_positions.lock().unwrap().clear();
+                *clip = Some(acquired);
                 self.state.grabbing.store(true, Ordering::SeqCst);
-                let mut pt = POINT::default();
-                let mut previous = RECT::default();
-                if GetCursorPos(&mut pt).is_ok() && GetClipCursor(&mut previous).is_ok() {
-                    let pinned = RECT {
-                        left: pt.x,
-                        top: pt.y,
-                        right: pt.x + 1,
-                        bottom: pt.y + 1,
-                    };
-                    let desktop_left = GetSystemMetrics(SM_XVIRTUALSCREEN);
-                    let desktop_top = GetSystemMetrics(SM_YVIRTUALSCREEN);
-                    let desktop = RECT {
-                        left: desktop_left,
-                        top: desktop_top,
-                        right: desktop_left + GetSystemMetrics(SM_CXVIRTUALSCREEN),
-                        bottom: desktop_top + GetSystemMetrics(SM_CYVIRTUALSCREEN),
-                    };
-                    if ClipCursor(Some(&pinned)).is_ok() {
-                        *clip = Some((pinned, (previous != desktop).then_some(previous)));
-                    }
-                }
             } else {
-                if let Some((pinned, previous)) = clip.take() {
-                    let mut current = RECT::default();
-                    if GetClipCursor(&mut current).is_ok() && current == pinned {
-                        let _ = ClipCursor(previous.as_ref().map(std::ptr::from_ref));
-                    }
+                if let Some(clip) = clip.take() {
+                    clip.restore();
+                } else if !self.is_grabbing() {
+                    return;
                 }
                 if let Some((wx, wy)) = warp_to {
                     let _ = SetCursorPos(wx, wy);
@@ -460,8 +530,8 @@ unsafe extern "system" fn raw_wnd_proc(
             hdr_size,
         );
         if read == size_of::<RAWINPUT>() as u32 && raw.header.dwType == RIM_TYPEMOUSE.0 {
-            let guard = hook_state_cell().lock().unwrap();
-            if let Some(state) = guard.as_ref().filter(|s| s.grabbing.load(Ordering::SeqCst)) {
+            let state = hook_state_cell().lock().unwrap().clone();
+            if let Some(state) = state.filter(|state| state.can_forward_motion()) {
                 let mouse = raw.data.mouse;
                 let (dx, dy) = if mouse.usFlags.0 & MOUSE_MOVE_ABSOLUTE.0 != 0 {
                     let (width, height) = if mouse.usFlags.0 & MOUSE_VIRTUAL_DESKTOP.0 != 0 {

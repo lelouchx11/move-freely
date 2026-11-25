@@ -40,6 +40,8 @@ pub enum InputEvent {
     },
     /// Display configuration changed (monitor plugged/unplugged/rearranged).
     MonitorsChanged,
+    /// The OS stopped isolating physical input during a remote handoff.
+    CaptureLost,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

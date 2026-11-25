@@ -13,7 +13,7 @@ use std::time::Duration;
 use mf_core::clipboard::ClipboardPayload;
 use mf_core::config::ModifierMappingMode;
 use mf_core::input::headless::RecordedInjection;
-use mf_core::input::InputEvent;
+use mf_core::input::{CaptureController, InputEvent};
 use mf_core::{AppConfig, EngineHandle, EngineMode, HeadlessTestHandles, MoveFreelyEngine};
 use mf_protocol::{
     BoundaryMode, Button, DevicePlacement, EdgeMask, KeyCode, ModifierFlags, Monitor,
@@ -478,4 +478,63 @@ async fn controller_keeps_cursor_when_peer_cannot_receive_input() {
     let _ = shutdown.send(true);
     let _ = fs::remove_dir_all(dir);
     let _ = fs::remove_dir_all(controller_dir);
+}
+
+#[tokio::test]
+async fn losing_cursor_isolation_ends_the_handoff_and_clears_held_input() {
+    let (controller, io, controller_dir, _) = start_node("controller", vec![]).await;
+    let (receiver, remote_io, receiver_dir, addr) = start_node("receiver", vec![]).await;
+    pair_and_connect(&controller, &receiver, addr).await;
+
+    controller.focus_device(receiver.local_id.clone());
+    let snapshot = controller.snapshot().await.unwrap();
+    assert_eq!(snapshot.focused_device, receiver.local_id);
+    assert!(snapshot.is_grabbing);
+
+    io.capture_tx.send(InputEvent::MouseButton {
+        button: Button::Left,
+        pressed: true,
+    }).unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if remote_io.injector.snapshot().iter().any(|event| matches!(
+                event,
+                RecordedInjection::Button { button: Button::Left, pressed: true }
+            )) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.expect("remote button press did not arrive");
+
+    io.capture_ctrl.set_grabbing(false, None);
+    // A sample already queued before the backend signalled the loss must not
+    // move the receiver after the local cursor becomes free.
+    io.capture_tx.send(InputEvent::RemotePointerDelta { dx: 12, dy: 4 }).unwrap();
+    io.capture_tx.send(InputEvent::CaptureLost).unwrap();
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if controller.snapshot().await.unwrap().focused_device == controller.local_id
+                && receiver.snapshot().await.unwrap().focused_device == controller.local_id
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.expect("both peers should return focus to the controller");
+    let remote_events = remote_io.injector.snapshot();
+    assert!(remote_events.iter().any(|event| matches!(
+        event,
+        RecordedInjection::Button { button: Button::Left, pressed: false }
+    )));
+    assert!(!remote_events.iter().any(|event| matches!(
+        event,
+        RecordedInjection::PointerAbs { .. } | RecordedInjection::PointerRel { .. }
+    )));
+
+    controller.shutdown();
+    receiver.shutdown();
+    let _ = fs::remove_dir_all(controller_dir);
+    let _ = fs::remove_dir_all(receiver_dir);
 }

@@ -1370,6 +1370,19 @@ impl EngineState {
             self.emit_snapshot();
             return;
         }
+        if matches!(ev, InputEvent::CaptureLost) {
+            if self.active_controller == self.local_id
+                && self.focused_device != self.local_id
+                && !self.capture_ctrl.as_ref().is_some_and(|ctrl| ctrl.is_grabbing())
+            {
+                self.emergency_cooldown_until = Some(Instant::now() + Duration::from_secs(1));
+                self.local_resistance.reset();
+                self.release_focus_to_local();
+                self.notify("warning", "Remote input ended when this computer took back the cursor.");
+                self.emit_snapshot();
+            }
+            return;
+        }
 
         // 1. Check global shortcuts on key press!
         if let InputEvent::Key {
@@ -1492,6 +1505,9 @@ impl EngineState {
         }
 
         // 3. Active controller driving a REMOTE screen!
+        if !self.capture_ctrl.as_ref().is_some_and(|ctrl| ctrl.is_grabbing()) {
+            return;
+        }
         let target = &self.focused_device;
         match ev {
             InputEvent::RemotePointerDelta { dx, dy } => {
